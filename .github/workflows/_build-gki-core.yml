@@ -400,6 +400,17 @@ jobs:
               fi
               sed -i 's|"asm/patching.h"|"asm/text-patching.h"|g' common/drivers/kernelsu/hook/patch_memory.h
             fi
+
+            # x86_64 memakai generic entry: TIF_SECCOMP tidak ada, seccomp ditandai lewat
+            # syscall_work. Makro *_syscall_work() berlaku untuk generic entry maupun bukan.
+            SECCOMP_FILES=$(grep -rlE '(test|set|clear)_thread_flag\(TIF_SECCOMP\)' common/drivers/kernelsu || true)
+            for f in $SECCOMP_FILES; do
+              echo "Fixing TIF_SECCOMP for generic entry in $f"
+              sed -i -E 's/\b(test|set|clear)_thread_flag\(TIF_SECCOMP\)/\1_syscall_work(SECCOMP)/g' "$f"
+            done
+            if grep -rn 'TIF_SECCOMP' common/drivers/kernelsu; then
+              echo "Warning: masih ada pemakaian TIF_SECCOMP lain (lihat di atas); pastikan dijaga #ifdef CONFIG_GENERIC_ENTRY."
+            fi
           fi
 
           KSU_HAS_INDIRECT_SAFE_CHECK=false
