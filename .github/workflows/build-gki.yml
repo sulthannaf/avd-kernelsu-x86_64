@@ -20,7 +20,7 @@ on:
           - 'a16-api36.1-6.12'
         default: 'all'
       ksu_ref:
-        description: 'KernelSU / KernelSU-Next tag, commit, or auto for per-target defaults'
+        description: 'KernelSU / KernelSU-Next tag, commit, or auto for per-target defaults (KernelSU-Next-SUSFS: dev-susfs)'
         required: true
         type: string
         default: 'auto'
@@ -31,6 +31,7 @@ on:
         options:
           - 'KernelSU'
           - 'KernelSU-Next'
+          - 'KernelSU-Next-SUSFS'
         default: 'KernelSU'
       arch:
         description: 'Target architecture'
