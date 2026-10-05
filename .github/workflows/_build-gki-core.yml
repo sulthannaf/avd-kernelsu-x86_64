@@ -69,9 +69,9 @@ jobs:
                   return None
               return tuple(int(part) for part in match.groups())
 
-          def is_v34_or_newer(ref):
+          def is_v32_or_newer(ref):
               version = parse_semver(ref)
-              return version is not None and version >= (3, 4, 0)
+              return version is not None and version >= (3, 2, 0)
 
           if not selected_ksu_ref:
               print("ksu_ref cannot be empty", file=sys.stderr)
@@ -178,6 +178,10 @@ jobs:
           echo "KSU_X86_SYSCALL_HARDENING_PATCHED=false" >> "$GITHUB_ENV"
           echo "KSU_X86_SYSCALL_HARDENING_DEFAULT_OFF=false" >> "$GITHUB_ENV"
           echo "KSU_X86_SYSCALL_CHECK_BYPASSED=false" >> "$GITHUB_ENV"
+          echo "SUSFS_ENABLED=false" >> "$GITHUB_ENV"
+          echo "SUSFS_BRANCH=none" >> "$GITHUB_ENV"
+          echo "SUSFS_COMMIT=none" >> "$GITHUB_ENV"
+          echo "SUSFS_VERSION=none" >> "$GITHUB_ENV"
 
       - name: Sync Kernel Source
         run: |
@@ -285,6 +289,10 @@ jobs:
             KSU_VERSION_LABEL=$(echo "$KSU_REF" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^-+//; s/-+$//')
           fi
 
+          if [ "${{ inputs.ksu_variant }}" = "KernelSU-Next-SUSFS" ] && [[ "$KSU_VERSION_LABEL" != *susfs* ]]; then
+            KSU_VERSION_LABEL="${KSU_VERSION_LABEL}-susfs"
+          fi
+
           API_LABEL="API$(echo "$API_LEVEL" | sed -E 's/[^0-9A-Za-z._-]+/-/g; s/^-+//; s/-+$//')"
           DIST_NAME="dist-${ANDROID_LABEL}-${API_LABEL}-${KERNEL_VERSION}-${ARCH_LABEL}-${BUILD_ID}-${KSU_VERSION_LABEL}"
           ARTIFACT_NAME="$DIST_NAME"
@@ -337,6 +345,11 @@ jobs:
               KSU_REPO_URL="https://github.com/KernelSU-Next/KernelSU-Next.git"
               KSU_REPO_DIR="KernelSU-Next"
               ;;
+            KernelSU-Next-SUSFS)
+              # Fork pershoot: KernelSU-Next + integrasi SUSFS (branch dev-susfs)
+              KSU_REPO_URL="https://github.com/pershoot/KernelSU-Next.git"
+              KSU_REPO_DIR="KernelSU-Next"
+              ;;
             *)
               echo "Unsupported KernelSU variant: ${{ inputs.ksu_variant }}"
               exit 1
@@ -345,6 +358,16 @@ jobs:
 
           git clone "$KSU_REPO_URL" "$KSU_REPO_DIR"
           "./$KSU_REPO_DIR/kernel/setup.sh" "$KSU_REF"
+
+          if [ "${{ inputs.ksu_variant }}" = "KernelSU-Next-SUSFS" ]; then
+            echo "KernelSU-Next-SUSFS checked out at: $(git -C "$KSU_REPO_DIR" rev-parse HEAD)"
+            if ! grep -rqs 'KSU_SUSFS' "$KSU_REPO_DIR/kernel"; then
+              echo "Error: kode KernelSU-Next yang ter-checkout tidak berisi integrasi SUSFS."
+              echo "Untuk varian KernelSU-Next-SUSFS, isi ksu_ref dengan 'dev-susfs' atau hash commit dari branch dev-susfs."
+              echo "Tag seperti v3.4.0 menunjuk ke kode resmi tanpa SUSFS."
+              exit 1
+            fi
+          fi
 
           rm -rf common/drivers/kernelsu
           cp -r "$KSU_REPO_DIR/kernel" common/drivers/kernelsu
@@ -463,6 +486,93 @@ jobs:
               sed -i "s/KSU_VERSION_TAG_FALLBACK := .*/KSU_VERSION_TAG_FALLBACK := $KSU_VERSION_TAG_SED/g" "$f"
             fi
           done
+
+      - name: Integrate SUSFS
+        if: ${{ inputs.ksu_variant == 'KernelSU-Next-SUSFS' }}
+        run: |
+          KERNEL_VERSION="${{ steps.metadata.outputs.kernel_version }}"
+          SUSFS_REPO_URL="https://gitlab.com/simonpunk/susfs4ksu.git"
+          SUSFS_BRANCH="gki-${TARGET_ANDROID_VERSION}-${KERNEL_VERSION}"
+          echo "Using SUSFS branch: $SUSFS_BRANCH"
+
+          if ! git ls-remote --exit-code --heads "$SUSFS_REPO_URL" "refs/heads/$SUSFS_BRANCH" >/dev/null; then
+            echo "Error: branch SUSFS $SUSFS_BRANCH tidak ditemukan di $SUSFS_REPO_URL"
+            exit 1
+          fi
+
+          git clone --depth=1 --branch "$SUSFS_BRANCH" "$SUSFS_REPO_URL" susfs4ksu
+          SUSFS_COMMIT=$(git -C susfs4ksu rev-parse --short HEAD)
+          PATCH_FILE="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_${SUSFS_BRANCH}.patch"
+
+          if [ ! -f "$PATCH_FILE" ]; then
+            echo "Error: $PATCH_FILE tidak ditemukan. Isi kernel_patches:"
+            ls -la susfs4ksu/kernel_patches
+            exit 1
+          fi
+
+          # Salin source SUSFS ke kernel
+          cp -r susfs4ksu/kernel_patches/fs/. kernel/common/fs/
+          cp -r susfs4ksu/kernel_patches/include/linux/. kernel/common/include/linux/
+
+          # Patch kernel
+          cd kernel/common
+          patch -p1 --forward --batch --no-backup-if-mismatch < "$PATCH_FILE" || true
+
+          REJECTS=$(find . -name '*.rej' -not -path './.git/*')
+          if [ -n "$REJECTS" ]; then
+            echo "Error: sebagian patch SUSFS gagal diterapkan:"
+            for r in $REJECTS; do
+              echo "===== $r ====="
+              cat "$r"
+            done
+            exit 1
+          fi
+
+          SUSFS_VERSION=$(grep -oP 'SUSFS_VERSION\s+"\K[^"]+' include/linux/susfs.h 2>/dev/null || echo unknown)
+          echo "SUSFS version: $SUSFS_VERSION ($SUSFS_COMMIT)"
+
+          # Aktifkan SUSFS di defconfig (hanya opsi yang benar-benar ada di Kconfig)
+          if [ "$TARGET_ARCH" = "x86_64" ]; then
+            DEFCONFIG="arch/x86/configs/gki_defconfig"
+          else
+            DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          fi
+
+          for opt in \
+            KSU \
+            KSU_SUSFS \
+            KSU_SUSFS_SUS_PATH \
+            KSU_SUSFS_SUS_MOUNT \
+            KSU_SUSFS_SUS_KSTAT \
+            KSU_SUSFS_SUS_MAP \
+            KSU_SUSFS_SPOOF_UNAME \
+            KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+            KSU_SUSFS_OPEN_REDIRECT \
+            KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            KSU_SUSFS_ENABLE_LOG; do
+            if grep -rqsE "^[[:space:]]*(menu)?config[[:space:]]+${opt}\$" drivers/kernelsu fs; then
+              sed -i "/^CONFIG_${opt}=/d; /^# CONFIG_${opt} is not set/d" "$DEFCONFIG"
+              echo "CONFIG_${opt}=y" >> "$DEFCONFIG"
+              echo "Enabled CONFIG_${opt}"
+            else
+              echo "Skipping CONFIG_${opt} (tidak ada di Kconfig)"
+            fi
+          done
+
+          if ! grep -qx 'CONFIG_KSU_SUSFS=y' "$DEFCONFIG"; then
+            echo "Error: CONFIG_KSU_SUSFS tidak ditemukan di Kconfig KernelSU-Next."
+            exit 1
+          fi
+
+          # defconfig sudah tidak minimal lagi, matikan pengecekan check_defconfig
+          for f in build.config.gki*; do
+            [ -f "$f" ] && sed -i 's/check_defconfig//' "$f"
+          done
+
+          echo "SUSFS_ENABLED=true" >> "$GITHUB_ENV"
+          echo "SUSFS_BRANCH=$SUSFS_BRANCH" >> "$GITHUB_ENV"
+          echo "SUSFS_COMMIT=$SUSFS_COMMIT" >> "$GITHUB_ENV"
+          echo "SUSFS_VERSION=$SUSFS_VERSION" >> "$GITHUB_ENV"
 
       - name: Apply x86_64 Syscall Hardening Patches
         if: ${{ matrix.arch == 'x86_64' }}
@@ -644,6 +754,10 @@ jobs:
           x86_64 Syscall Hardening Default Off: ${KSU_X86_SYSCALL_HARDENING_DEFAULT_OFF}
           x86_64 KernelSU Syscall Check Bypassed: ${KSU_X86_SYSCALL_CHECK_BYPASSED}
           Required Emulator Boot Arg: ${REQUIRED_BOOT_ARG}
+          SUSFS Enabled: ${SUSFS_ENABLED}
+          SUSFS Branch: ${SUSFS_BRANCH}
+          SUSFS Commit: ${SUSFS_COMMIT}
+          SUSFS Version: ${SUSFS_VERSION}
           Build Date: $(date -u)
           EOF
 
