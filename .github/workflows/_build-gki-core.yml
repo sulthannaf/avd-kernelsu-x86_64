@@ -411,6 +411,20 @@ jobs:
             if grep -rn 'TIF_SECCOMP' common/drivers/kernelsu; then
               echo "Warning: masih ada pemakaian TIF_SECCOMP lain (lihat di atas); pastikan dijaga #ifdef CONFIG_GENERIC_ENTRY."
             fi
+
+            # Di arm64 <linux/compat.h> ikut ter-include secara tidak langsung, di x86_64 tidak.
+            # Tambahkan include eksplisit ke file yang memakai tipe compat_*.
+            COMPAT_FILES=$(grep -rlE '\bcompat_(uptr_t|ulong_t|uint_t|size_t|long_t|ptr)\b' common/drivers/kernelsu --include='*.c' --include='*.h' || true)
+            for f in $COMPAT_FILES; do
+              if ! grep -qE '^#include[[:space:]]*<linux/compat\.h>' "$f"; then
+                echo "Adding #include <linux/compat.h> to $f"
+                if grep -q '^#include' "$f"; then
+                  sed -i '0,/^#include/s//#include <linux\/compat.h>\n#include/' "$f"
+                else
+                  sed -i '1i #include <linux/compat.h>' "$f"
+                fi
+              fi
+            done
           fi
 
           KSU_HAS_INDIRECT_SAFE_CHECK=false
