@@ -69,9 +69,9 @@ jobs:
                   return None
               return tuple(int(part) for part in match.groups())
 
-          def is_v32_or_newer(ref):
+          def is_v34_or_newer(ref):
               version = parse_semver(ref)
-              return version is not None and version >= (3, 2, 0)
+              return version is not None and version >= (3, 4, 0)
 
           if not selected_ksu_ref:
               print("ksu_ref cannot be empty", file=sys.stderr)
