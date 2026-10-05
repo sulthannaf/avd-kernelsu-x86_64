@@ -531,43 +531,68 @@ jobs:
           SUSFS_VERSION=$(grep -oP 'SUSFS_VERSION\s+"\K[^"]+' include/linux/susfs.h 2>/dev/null || echo unknown)
           echo "SUSFS version: $SUSFS_VERSION ($SUSFS_COMMIT)"
 
-          # Aktifkan SUSFS di defconfig (hanya opsi yang benar-benar ada di Kconfig)
-          if [ "$TARGET_ARCH" = "x86_64" ]; then
-            DEFCONFIG="arch/x86/configs/gki_defconfig"
-          else
-            DEFCONFIG="arch/arm64/configs/gki_defconfig"
-          fi
+          # Aktifkan SUSFS lewat default Kconfig, bukan lewat gki_defconfig.
+          # Kleaf membandingkan gki_defconfig dengan hasil savedefconfig; opsi yang
+          # ditambahkan ke defconfig tapi bernilai default akan dianggap tidak cocok.
+          SUSFS_OPTS="KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SUS_MAP KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS KSU_SUSFS_ENABLE_LOG" \
+          python3 - <<'PYEOF'
+          import os
+          import re
+          import sys
 
-          for opt in \
-            KSU \
-            KSU_SUSFS \
-            KSU_SUSFS_SUS_PATH \
-            KSU_SUSFS_SUS_MOUNT \
-            KSU_SUSFS_SUS_KSTAT \
-            KSU_SUSFS_SUS_MAP \
-            KSU_SUSFS_SPOOF_UNAME \
-            KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-            KSU_SUSFS_OPEN_REDIRECT \
-            KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-            KSU_SUSFS_ENABLE_LOG; do
-            if grep -rqsE "^[[:space:]]*(menu)?config[[:space:]]+${opt}\$" drivers/kernelsu fs; then
-              sed -i "/^CONFIG_${opt}=/d; /^# CONFIG_${opt} is not set/d" "$DEFCONFIG"
-              echo "CONFIG_${opt}=y" >> "$DEFCONFIG"
-              echo "Enabled CONFIG_${opt}"
-            else
-              echo "Skipping CONFIG_${opt} (tidak ada di Kconfig)"
-            fi
-          done
+          opts = os.environ["SUSFS_OPTS"].split()
+          kconfigs = []
+          for root, _, files in os.walk("drivers/kernelsu"):
+              for name in files:
+                  if name.startswith("Kconfig"):
+                      kconfigs.append(os.path.join(root, name))
 
-          if ! grep -qx 'CONFIG_KSU_SUSFS=y' "$DEFCONFIG"; then
-            echo "Error: CONFIG_KSU_SUSFS tidak ditemukan di Kconfig KernelSU-Next."
-            exit 1
-          fi
+          block_end = re.compile(r"^(config|menuconfig|endmenu|menu|if|endif|source|choice|endchoice|comment)\b")
+          found = set()
+          for path in kconfigs:
+              with open(path, encoding="utf-8") as f:
+                  lines = f.read().split("\n")
+              out = []
+              i = 0
+              changed = False
+              while i < len(lines):
+                  line = lines[i]
+                  m = re.match(r"^\s*(?:menu)?config\s+(\S+)\s*$", line)
+                  if m and m.group(1) in opts:
+                      opt = m.group(1)
+                      found.add(opt)
+                      block = [line]
+                      i += 1
+                      while i < len(lines) and not block_end.match(lines[i].strip()):
+                          block.append(lines[i])
+                          i += 1
+                      default_idx = [k for k, l in enumerate(block) if re.match(r"^\s*default\b", l)]
+                      if default_idx:
+                          for k in default_idx:
+                              indent = re.match(r"^(\s*)", block[k]).group(1)
+                              block[k] = f"{indent}default y"
+                      else:
+                          type_idx = next((k for k, l in enumerate(block) if re.match(r"^\s*(bool|tristate)\b", l)), 0)
+                          indent = re.match(r"^(\s*)", block[type_idx]).group(1) or "\t"
+                          block.insert(type_idx + 1, f"{indent}default y")
+                      out.extend(block)
+                      changed = True
+                      print(f"Default y: CONFIG_{opt} ({path})")
+                      continue
+                  out.append(line)
+                  i += 1
+              if changed:
+                  with open(path, "w", encoding="utf-8") as f:
+                      f.write("\n".join(out))
 
-          # defconfig sudah tidak minimal lagi, matikan pengecekan check_defconfig
-          for f in build.config.gki*; do
-            [ -f "$f" ] && sed -i 's/check_defconfig//' "$f"
-          done
+          for opt in opts:
+              if opt not in found:
+                  print(f"Skipping CONFIG_{opt} (tidak ada di Kconfig)")
+
+          if "KSU_SUSFS" not in found:
+              print("Error: CONFIG_KSU_SUSFS tidak ditemukan di Kconfig KernelSU-Next.", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
 
           echo "SUSFS_ENABLED=true" >> "$GITHUB_ENV"
           echo "SUSFS_BRANCH=$SUSFS_BRANCH" >> "$GITHUB_ENV"
@@ -729,6 +754,24 @@ jobs:
           fi
 
           cp bzImage ../../output/ 2>/dev/null || true
+
+          if [ "$SUSFS_ENABLED" = "true" ]; then
+            KIMAGE=""
+            for img in bzImage Image Image.gz; do
+              [ -f "$img" ] && KIMAGE="$img" && break
+            done
+            if [ -n "$KIMAGE" ] && ../common/scripts/extract-ikconfig "$KIMAGE" > ../../output/kernel-config.txt 2>/dev/null; then
+              echo "SUSFS options in built kernel:"
+              grep -E '^CONFIG_KSU(_SUSFS[A-Z_]*)?=' ../../output/kernel-config.txt || true
+              if ! grep -qx 'CONFIG_KSU_SUSFS=y' ../../output/kernel-config.txt; then
+                echo "Error: kernel selesai dibuild tapi CONFIG_KSU_SUSFS tidak aktif."
+                exit 1
+              fi
+            else
+              rm -f ../../output/kernel-config.txt
+              echo "Warning: tidak bisa mengekstrak config dari $KIMAGE, verifikasi SUSFS dilewati."
+            fi
+          fi
           cp Image ../../output/ 2>/dev/null || true
           cp Image.gz ../../output/ 2>/dev/null || true
 
