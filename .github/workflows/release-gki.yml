@@ -19,7 +19,7 @@ on:
         description: 'Release tag from the selected KernelSU project, must be vX.Y.Z'
         required: true
         type: string
-        default: 'v3.2.0'
+        default: 'v3.4.0'
       arch:
         description: 'Target architecture'
         required: true
