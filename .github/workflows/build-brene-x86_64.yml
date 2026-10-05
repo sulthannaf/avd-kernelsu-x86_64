@@ -97,7 +97,26 @@ jobs:
           [ -x "$CC" ] || { echo "Compiler tidak ada: $CC"; exit 1; }
 
           mkdir -p out
-          "$CC" -O2 -fPIE -pie -I"$TOOL_DIR" -o out/susfs "$TOOL_DIR"/*.c
+          PROJECT_DIR=$(dirname "$TOOL_DIR")
+
+          if [ -f "$TOOL_DIR/Android.mk" ]; then
+            # Pakai Android.mk bawaan susfs4ksu (sumber & include path sudah diatur di sana)
+            "$NDK/ndk-build" -C "$PROJECT_DIR" \
+              NDK_PROJECT_PATH=. \
+              APP_BUILD_SCRIPT=jni/Android.mk \
+              NDK_APPLICATION_MK=jni/Application.mk \
+              APP_ABI=x86_64 \
+              APP_PLATFORM=android-"$API_LEVEL" \
+              -j"$(nproc)"
+            BUILT=$(find "$PROJECT_DIR/libs/x86_64" -maxdepth 1 -type f ! -name '*.so' | head -n1)
+            [ -n "$BUILT" ] || { echo "Output ndk-build tidak ditemukan"; ls -laR "$PROJECT_DIR/libs" || true; exit 1; }
+            echo "ndk-build output: $BUILT"
+            cp "$BUILT" out/susfs
+          else
+            # Cadangan: compile manual semua .c dengan semua folder header
+            INCLUDES=$(find "$TOOL_DIR" -type d -printf '-I%p ')
+            "$CC" -O2 -fPIE -pie $INCLUDES -o out/susfs $(find "$TOOL_DIR" -name '*.c')
+          fi
           "$STRIP" out/susfs
           file out/susfs
           file out/susfs | grep -q 'x86-64' || { echo "Hasil build bukan x86_64"; exit 1; }
