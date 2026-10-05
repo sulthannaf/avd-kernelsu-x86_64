@@ -161,8 +161,8 @@ jobs:
           unzip -l "dist/${ZIP_NAME}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.ZIP_NAME }}
           path: dist/${{ env.ZIP_NAME }}.zip
+          archive: false
           if-no-files-found: error
