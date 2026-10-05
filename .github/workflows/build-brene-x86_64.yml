@@ -1,0 +1,149 @@
+name: Build BRENE x86_64
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      brene_tag:
+        description: 'Tag release BRENE (kosongkan = rilis terbaru)'
+        required: false
+        type: string
+        default: ''
+      susfs_branch:
+        description: 'Branch susfs4ksu (samakan dengan kernel)'
+        required: true
+        type: string
+        default: 'gki-android16-6.12'
+      susfs_ref:
+        description: 'Commit susfs4ksu (samakan dengan "SUSFS Commit" di build-info.txt; kosongkan = ujung branch)'
+        required: false
+        type: string
+        default: 'b213c54'
+      api_level:
+        description: 'Android API minimum untuk binary'
+        required: true
+        type: string
+        default: '29'
+
+jobs:
+  build:
+    name: Build BRENE x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download BRENE release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRENE_TAG: ${{ inputs.brene_tag }}
+        run: |
+          mkdir -p brene-dl
+          if [ -n "$BRENE_TAG" ]; then
+            gh release download "$BRENE_TAG" --repo rrr333nnn333/BRENE --pattern '*.zip' --dir brene-dl
+          else
+            gh release download --repo rrr333nnn333/BRENE --pattern '*.zip' --dir brene-dl
+          fi
+          ls -la brene-dl
+          BRENE_ZIP=$(ls brene-dl/*.zip | head -n1)
+          [ -n "$BRENE_ZIP" ] || { echo "Zip BRENE tidak ditemukan di release"; exit 1; }
+
+          mkdir -p module
+          unzip -q "$BRENE_ZIP" -d module
+          [ -f module/customize.sh ] && [ -f module/tools/susfs ] || {
+            echo "Struktur zip BRENE berubah (customize.sh / tools/susfs tidak ada)."
+            find module -maxdepth 2
+            exit 1
+          }
+          echo "Original binary:"
+          file module/tools/susfs
+
+      - name: Clone susfs4ksu
+        env:
+          SUSFS_BRANCH: ${{ inputs.susfs_branch }}
+          SUSFS_REF: ${{ inputs.susfs_ref }}
+        run: |
+          git clone --single-branch --branch "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          if [ -n "$SUSFS_REF" ]; then
+            git -C susfs4ksu checkout "$SUSFS_REF"
+          fi
+          SUSFS_COMMIT=$(git -C susfs4ksu rev-parse --short HEAD)
+          SUSFS_VERSION=$(grep -oP 'SUSFS_VERSION\s+"\K[^"]+' susfs4ksu/kernel_patches/include/linux/susfs.h 2>/dev/null || echo unknown)
+          echo "SUSFS_COMMIT=$SUSFS_COMMIT" >> "$GITHUB_ENV"
+          echo "SUSFS_VERSION=$SUSFS_VERSION" >> "$GITHUB_ENV"
+          echo "susfs4ksu: $SUSFS_BRANCH @ $SUSFS_COMMIT ($SUSFS_VERSION)"
+
+      - name: Build ksu_susfs for x86_64
+        env:
+          API_LEVEL: ${{ inputs.api_level }}
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            echo "Android NDK tidak ditemukan di runner"
+            exit 1
+          fi
+          echo "Using NDK: $NDK"
+
+          TOOL_DIR=$(dirname "$(find susfs4ksu -path '*ksu_susfs*' -name 'main.c' | head -n1)")
+          if [ -z "$TOOL_DIR" ] || [ "$TOOL_DIR" = "." ]; then
+            echo "Sumber ksu_susfs (main.c) tidak ditemukan. Isi repo:"
+            find susfs4ksu -maxdepth 3 -not -path '*/.git*'
+            exit 1
+          fi
+          echo "ksu_susfs source dir: $TOOL_DIR"
+          ls -la "$TOOL_DIR"
+
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android${API_LEVEL}-clang"
+          STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          [ -x "$CC" ] || { echo "Compiler tidak ada: $CC"; exit 1; }
+
+          mkdir -p out
+          "$CC" -O2 -fPIE -pie -I"$TOOL_DIR" -o out/susfs "$TOOL_DIR"/*.c
+          "$STRIP" out/susfs
+          file out/susfs
+          file out/susfs | grep -q 'x86-64' || { echo "Hasil build bukan x86_64"; exit 1; }
+
+          # Pastikan perintah yang dipakai skrip BRENE ada di binary baru
+          for cmd in add_sus_path add_sus_path_loop add_sus_map add_sus_kstat add_sus_kstat_statically \
+                     update_sus_kstat update_sus_kstat_full_clone add_open_redirect set_uname \
+                     set_cmdline_or_bootconfig enable_log enable_avc_log_spoofing \
+                     hide_sus_mnts_for_non_su_procs enabled_features variant version; do
+            if ! strings out/susfs | grep -qx "$cmd"; then
+              echo "Warning: perintah '$cmd' tidak ditemukan di binary x86_64 (versi ksu_susfs mungkin berbeda dari BRENE)"
+            fi
+          done
+
+      - name: Patch BRENE for x86_64
+        run: |
+          cp -f out/susfs module/tools/susfs
+          chmod 755 module/tools/susfs
+
+          # Izinkan arsitektur x64 (nilai $ARCH untuk x86_64 di installer KernelSU)
+          sed -i 's/if \[\[ "${ARCH}" != "arm64" \]\]; then/if [[ "${ARCH}" != "x64" ]]; then/' module/customize.sh
+          sed -i "s/abort '\[❌\] Only arm64 is supported!'/abort '[❌] This build is for x86_64 (x64) only!'/" module/customize.sh
+          grep -q '"${ARCH}" != "x64"' module/customize.sh || {
+            echo "Gagal mengubah pengecekan arsitektur di customize.sh:"
+            grep -n 'ARCH' module/customize.sh
+            exit 1
+          }
+
+          # Tandai versi dan matikan auto-update (update resmi hanya untuk arm64)
+          BRENE_VERSION=$(grep '^version=' module/module.prop | cut -d= -f2)
+          sed -i "s/^version=.*/version=${BRENE_VERSION}-x86_64/" module/module.prop
+          sed -i '/^updateJson=/d' module/module.prop
+          cat module/module.prop
+
+          echo "BRENE_VERSION=$BRENE_VERSION" >> "$GITHUB_ENV"
+          echo "ZIP_NAME=BRENE-${BRENE_VERSION}-x86_64-susfs-${SUSFS_VERSION}-${SUSFS_COMMIT}" >> "$GITHUB_ENV"
+
+      - name: Package module
+        run: |
+          mkdir -p dist
+          (cd module && zip -r9 "../dist/${ZIP_NAME}.zip" .)
+          unzip -l "dist/${ZIP_NAME}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: dist/${{ env.ZIP_NAME }}.zip
+          if-no-files-found: error
