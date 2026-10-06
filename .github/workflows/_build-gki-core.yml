@@ -357,7 +357,30 @@ jobs:
           esac
 
           git clone "$KSU_REPO_URL" "$KSU_REPO_DIR"
+
+          # Commit yang sudah tidak ada di branch mana pun (mis. setelah branch di-rebase)
+          # tidak ikut ter-clone. GitHub masih menyimpannya dan bisa diambil dengan hash lengkap.
+          if [[ "$KSU_REF" =~ ^[0-9a-fA-F]{7,40}$ ]] && ! git -C "$KSU_REPO_DIR" cat-file -e "${KSU_REF}^{commit}" 2>/dev/null; then
+            if [ "${#KSU_REF}" -eq 40 ]; then
+              echo "Commit $KSU_REF tidak ada di branch mana pun, mengambil langsung dari GitHub..."
+              git -C "$KSU_REPO_DIR" fetch origin "$KSU_REF"
+            else
+              echo "Error: commit $KSU_REF tidak ditemukan di branch mana pun di $KSU_REPO_URL."
+              echo "Kemungkinan branch-nya sudah di-rebase. Isi ksu_ref dengan hash LENGKAP (40 karakter),"
+              echo "misalnya dari link commit di catatan rilis, supaya bisa diambil langsung dari GitHub."
+              exit 1
+            fi
+          fi
+
           "./$KSU_REPO_DIR/kernel/setup.sh" "$KSU_REF"
+
+          if [[ "$KSU_REF" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+            ACTUAL=$(git -C "$KSU_REPO_DIR" rev-parse HEAD)
+            if [[ "$ACTUAL" != "${KSU_REF,,}"* ]]; then
+              echo "Error: setup.sh gagal checkout $KSU_REF (HEAD sekarang $ACTUAL)."
+              exit 1
+            fi
+          fi
 
           if [ "${{ inputs.ksu_variant }}" = "KernelSU-Next-SUSFS" ]; then
             echo "KernelSU-Next-SUSFS checked out at: $(git -C "$KSU_REPO_DIR" rev-parse HEAD)"
